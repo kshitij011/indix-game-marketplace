@@ -6,9 +6,7 @@ import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
-// contract Indix is Initializable, Pausable, Ownable(msg.sender), ERC1155(""), ERC1155URIStorage{
 contract Indix is Initializable, PausableUpgradeable, OwnableUpgradeable, ERC1155URIStorageUpgradeable {
-
 
     uint256 public GAME_ID;
     uint256 gameIdCap;

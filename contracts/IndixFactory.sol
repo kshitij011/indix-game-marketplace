@@ -2,24 +2,18 @@
 pragma solidity ^0.8;
 
 import "@openzeppelin/contracts/proxy/Clones.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import {IIndix} from "./interfaces/IIndix.sol";
 
-interface IIndix {
-    function initialize(uint256, address, uint256) external;
-    function pause() external;
-    function unpause() external;
-    function purchaseSkin(uint256, address) external payable;
-    function skins(uint256, address) external view returns (uint256, uint256, string memory, uint256);
-}
-
-
-contract IndixFactory {
+contract IndixFactory is Ownable, ReentrancyGuard{
 
     using Clones for address;
-
-    address public immutable INDIX_BLUEPRINT;
-
-    // Indix immutable index;
     uint256 public totalGames;
+
+    address public indixBlueprint;
+    uint256 public constant MAX_GAMES_PER_PUBLISHER = 100;
+    uint256 public constant STAKE_AMOUNT = 0.1 ether;
 
     struct Game{
         string name;
@@ -32,69 +26,59 @@ contract IndixFactory {
     mapping(address => uint256) public lockedFunds;
     mapping(address => bool) private luckyWinner;
 
-    constructor(address _blurprint) {
-        INDIX_BLUEPRINT = _blurprint;
+    event FundsLocked(address indexed publisher, uint amount);
+    event GameRegistered(address indexed publisher, uint indexed _gameId, address indexed _gameAddress, string _gameName);
+    event Withdrawn(address indexed publisher, uint amount);
+    event BlueprintUpdated(address oldImpl, address newImpl);
+
+    constructor(address _blueprint) Ownable(msg.sender) {
+        require(_blueprint != address(0), "Invalid blueprint");
+        indixBlueprint = _blueprint;
     }
 
-    // Convert to USD
-    function lockFunds() external payable {
-        require(msg.value == 0.1 ether, "Invalid amount");
-        lockedFunds[msg.sender] = 0.1 ether;
+    function lockFunds() external payable  nonReentrant{
+        require(msg.value == STAKE_AMOUNT, "Invalid amount");
+        lockedFunds[msg.sender] = STAKE_AMOUNT;
+        emit FundsLocked(msg.sender, STAKE_AMOUNT);
 
-        // unpause contract functions if developer locks funds again
-        uint[] memory ownedGames = getOwnedGames(msg.sender);
-        if(ownedGames.length > 0){
-
-            for (uint256 i = 0; i < ownedGames.length; i++)
-            {
-                uint256 gameId = ownedGames[i];
-                Game storage game = games[gameId];
-                IIndix(game.deployedAddress).unpause();
-            }
-        }
+        _unpauseOwnedGames(msg.sender);
     }
 
     function registerGame(string calldata _gameName, uint256 _gameKeyPrice) public {
-        require(lockedFunds[msg.sender] > 0, "Lock funds before registration!");
+        require(lockedFunds[msg.sender] == STAKE_AMOUNT, "STAKE_REQUIRED!");
+        if(gamesOwned[msg.sender].length == MAX_GAMES_PER_PUBLISHER) {
+            revert ("Max limit reached, consider releasing from other account.");
+        }
         totalGames++;
-        address clone = INDIX_BLUEPRINT.clone();
+        address clone = indixBlueprint.clone();
 
-        // Indix game = new Indix(totalGames, msg.sender, _gameKeyPrice);
         IIndix(clone).initialize(totalGames, msg.sender, _gameKeyPrice);
 
-        games[totalGames] = Game(_gameName, clone, msg.sender);
+        games[totalGames] = Game({
+            name: _gameName,
+            deployedAddress: clone,
+            owner: msg.sender
+        });
         gamesOwned[msg.sender].push(totalGames);
 
+        emit GameRegistered(msg.sender, totalGames, clone, _gameName);
     }
 
-    function getGameAddress(uint256 _gameId) external view returns(address){
-        return games[_gameId].deployedAddress;
-    }
-
-    function withdraw() external {
-        require(lockedFunds[msg.sender] > 0, "Insufficient fund!");
+    function withdrawStake() external nonReentrant{
         uint amount = lockedFunds[msg.sender];
+        require(amount> 0, "Insufficient fund!");
         lockedFunds[msg.sender] = 0;
+
+        _pauseOwnedGames(msg.sender);
         (bool success, ) = msg.sender.call{value: amount}("");
         require(success, "Transfer failed!");
 
-        // pause contract functions like mint if developer withdraws
-        uint[] memory ownedGames = getOwnedGames(msg.sender);
-
-        for (uint256 i = 0; i < ownedGames.length; i++)
-        {
-            uint256 gameId = ownedGames[i];
-            Game storage game = games[gameId];
-            IIndix(game.deployedAddress).pause();
-        }
-    }
-
-    function getOwnedGames(address _dev) public view returns(uint[] memory) {
-        return gamesOwned[_dev];
+        emit Withdrawn(msg.sender, amount);
     }
 
     function openCrate() public {
-        // function to get random number from chainlinkVRF
+        // function to get random number from chainlinkVRF (will be implemented soon)
+        revert("feature coming soon!");
         uint256 luckyNumber;
         if(block.timestamp % luckyNumber == 77) {
             luckyWinner[msg.sender] = true;
@@ -102,11 +86,11 @@ contract IndixFactory {
     }
 
     function claimReward(uint256 _gameId, uint256 _skinId) public {
-        require(_gameId > totalGames, "Game doesn't exist!");
+        require(_gameId > 0 && _gameId <= totalGames, "Game doesn't exist!");
+        require(luckyWinner[msg.sender] == true, "Cannot claim");
         address gameContract = games[_gameId].deployedAddress;
         address gameDeveloper = games[_gameId].owner;
 
-        // uint256 skinQuantity = Indix(gameContract).quantityAvailable(_skinId, gameDeveloper);
         (
         ,
         uint256 availableQuantity,
@@ -117,7 +101,43 @@ contract IndixFactory {
         require(price <= 0.01 ether, "Price too high");
 
         IIndix(gameContract).purchaseSkin{value: price}(_skinId, msg.sender);
+        luckyWinner[msg.sender] = false;
+    }
+
+    function updateBlueprint(address newBlueprint) external onlyOwner {
+        require(newBlueprint != address(0), "Invalid blueprint");
+        address old = indixBlueprint;
+        indixBlueprint = newBlueprint;
+
+        emit BlueprintUpdated(old, newBlueprint);
+    }
+
+    // VIEW FUNCTIONS
+    function getGameAddress(uint256 _gameId) external view returns(address){
+        return games[_gameId].deployedAddress;
+    }
+
+    function getOwnedGames(address _dev) public view returns(uint[] memory) {
+        return gamesOwned[_dev];
+    }
+
+    // INTERNAL FUNCTIONS
+    function _unpauseOwnedGames(address dev) internal {
+        uint256[] memory ownedGames = gamesOwned[dev];
+        for(uint256 i; i < ownedGames.length; i++) {
+            uint256 gameId = ownedGames[i];
+            Game storage game = games[gameId];
+            IIndix(game.deployedAddress).unpause();
+        }
+    }
+
+    function _pauseOwnedGames(address dev) internal {
+        uint256[] memory ownedGames = gamesOwned[dev];
+        for(uint256 i; i < ownedGames.length; i++){
+            uint256 gameId = ownedGames[i];
+            Game storage game = games[gameId];
+            IIndix(game.deployedAddress).pause();
+        }
+
     }
 }
-
-// 100000000000000000
